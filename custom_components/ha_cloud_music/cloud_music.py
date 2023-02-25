@@ -1,10 +1,18 @@
-import uuid, time, logging, os, hashlib, aiohttp
+from unittest import result
+import logging
+import uuid, time, json, os, random, aiohttp
 from urllib.parse import quote
 from homeassistant.helpers.network import get_url
 from .http_api import http_get, http_cookie
 from .models.music_info import MusicInfo, MusicSource
 from homeassistant.helpers.storage import STORAGE_DIR
 from homeassistant.util.json import load_json, save_json
+from datetime import datetime
+from homeassistant.components import (
+    persistent_notification,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
 
 from .browse_media import (
     async_browse_media, 
@@ -12,9 +20,8 @@ from .browse_media import (
     async_media_previous_track, 
     async_media_next_track
 )
-
-def md5(data):
-    return hashlib.md5(data.encode('utf-8')).hexdigest()
+import asyncio
+from http.cookies import SimpleCookie
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +49,90 @@ class CloudMusic():
     def netease_image_url(self, url, size=200):
         return f'{url}?param={size}y{size}'
 
+    # 二维码登录
+    async def qr_login(self):
+        qr_key_url = f'{self.api_url}/login/qr/key'
+        data = await http_get(qr_key_url)
+        _LOGGER.debug(f'url:{qr_key_url},resp:{json.dumps(data)}')
+        res_data = data.get('data', {})
+        res_code = data.get('code', {})
+        timestamp = str(int(datetime.now().timestamp()))
+        # 登录成功
+        if res_code == 200:
+            # key获取成功
+            unikey = res_data.get('unikey')
+            # 开始获取二维码
+            qr_img_url = f'{self.api_url}/login/qr/create?qrimg=true&key={quote(unikey)}&timestamp={quote(timestamp)}'
+            data = await http_get(qr_img_url)
+            _LOGGER.debug(f'url:{qr_img_url},resp:{json.dumps(data)}')
+            res_data = data.get('data', {})
+            res_code = data.get('code', {})
+            if res_code == 200:
+                #二维码的base64
+                qr_img_base64 = res_data.get('qrimg')
+                # 页面展示base64给用户扫码
+                message = ("打开网易云扫码登录\n"
+                        f"![image]({qr_img_base64})")
+                _LOGGER.debug(f'qr_img_base64:{qr_img_base64}')
+                persistent_notification.async_create(self.hass , message, "二维码登录")
+                # 用户开始扫码,进入轮询监测设置一个超时时间
+                await self.check_qr_login_status(unikey)
+            else:
+                return
+        else:
+            _LOGGER.debug(res_data)
+
+    async def check_qr_login_status(self, unikey):
+        #开始循环
+        while(True):
+            timestamp = str(int(datetime.now().timestamp()))
+            check_url = f'{self.api_url}/login/qr/check?key={quote(unikey)}&timestamp={quote(timestamp)}'
+            data = await http_get(check_url)
+            _LOGGER.debug(f'url:{check_url},resp:{json.dumps(data)}')
+            res_code = data.get('code', {})
+            if res_code == 800:
+                #二维码过期
+                _LOGGER.debug('qr code expired')
+                break
+            elif res_code == 801 or res_code == 802:
+                #等待扫码 or 授权中
+                #一秒一次请求
+                _LOGGER.debug('wait 1 second and check again')
+                await asyncio.sleep(1)
+            elif res_code == 803:
+                #成功 cookie
+                cookies_raw = data.get('cookie', {}).split(";")
+                cookies = {}
+                #解析键值对
+                for c in cookies_raw:
+                    if c.find("=") == -1:
+                        continue
+                    k,v = c.split("=")
+                    if k.strip() in ["Max-Age","Expires","Path"]:
+                        continue
+                    cookies[k.strip()] = v
+                timestamp = str(int(datetime.now().timestamp()))
+                #获取uid信息
+                status_url = f'{self.api_url}/login/status?timestamp={quote(timestamp)}'
+                data = await http_get(status_url)
+                _LOGGER.debug(f'url:{status_url},resp:{json.dumps(data)}')
+                res_data = data.get('data', {})
+                res_code = res_data['code']
+                if res_code == 200:
+                    # 写入cookie
+                    uid = res_data['account']['id']
+                    self.userinfo = {
+                        'uid': uid,
+                        'cookie': cookies
+                    }
+                    save_json(self.userinfo_filepath, self.userinfo)
+                    break
+                else:
+                    #获取状态失败,再来一次
+                    continue
+            else:
+                break
+
     # 登录
     async def login(self, username, password):
         login_url = f'{self.api_url}/login'
@@ -50,8 +141,7 @@ class CloudMusic():
         else:
             login_url = login_url + '/cellphone?phone='
 
-        data = await http_cookie(login_url + f'{quote(username)}&md5_password={md5(password)}')
-        _LOGGER.debug(data)
+        data = await http_cookie(login_url + f'{quote(username)}&password={quote(password)}')
         res_data = data.get('data', {})
         # 登录成功
         if res_data.get('code') == 200:
@@ -65,7 +155,7 @@ class CloudMusic():
             save_json(self.userinfo_filepath, self.userinfo)
             return res_data
         else:
-            print(res_data)
+            _LOGGER.debug("login res_data:" + res_data)
 
     # 获取播放链接
     def get_play_url(self, id, song, singer, source):

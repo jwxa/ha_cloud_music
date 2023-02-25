@@ -62,7 +62,7 @@ class OptionsFlowHandler(OptionsFlow):
 
             cloud_music = self.hass.data['cloud_music']
 
-            result = await cloud_music.login(username, password)
+            result = await cloud_music.qr_login()
             if result is not None:
                 return self.async_create_entry(title='', data=user_input)
             else:
