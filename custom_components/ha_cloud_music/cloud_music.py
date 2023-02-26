@@ -1,6 +1,6 @@
 from unittest import result
-import logging
-import uuid, time, json, os, random, aiohttp
+import uuid, time, logging, json, os, random, hashlib, aiohttp
+
 from urllib.parse import quote
 from homeassistant.helpers.network import get_url
 from .http_api import http_get, http_cookie
@@ -13,6 +13,9 @@ from homeassistant.components import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+
+def md5(data):
+    return hashlib.md5(data.encode('utf-8')).hexdigest()
 
 from .browse_media import (
     async_browse_media, 
@@ -56,7 +59,7 @@ class CloudMusic():
         _LOGGER.debug(f'url:{qr_key_url},resp:{json.dumps(data)}')
         res_data = data.get('data', {})
         res_code = data.get('code', {})
-        timestamp = str(int(datetime.now().timestamp()))
+        timestamp = str(datetime.now().timestamp())
         # 登录成功
         if res_code == 200:
             # key获取成功
@@ -71,10 +74,10 @@ class CloudMusic():
                 #二维码的base64
                 qr_img_base64 = res_data.get('qrimg')
                 # 页面展示base64给用户扫码
-                message = ("打开网易云扫码登录\n"
+                message = ("请打开网易云音乐扫码登录\n"
                         f"![image]({qr_img_base64})")
                 _LOGGER.debug(f'qr_img_base64:{qr_img_base64}')
-                persistent_notification.async_create(self.hass , message, "二维码登录")
+                persistent_notification.async_create(self.hass , message, "ha_cloud_music")
                 # 用户开始扫码,进入轮询监测设置一个超时时间
                 await self.check_qr_login_status(unikey)
             else:
@@ -85,7 +88,7 @@ class CloudMusic():
     async def check_qr_login_status(self, unikey):
         #开始循环
         while(True):
-            timestamp = str(int(datetime.now().timestamp()))
+            timestamp = str(datetime.now().timestamp())
             check_url = f'{self.api_url}/login/qr/check?key={quote(unikey)}&timestamp={quote(timestamp)}'
             data = await http_get(check_url)
             _LOGGER.debug(f'url:{check_url},resp:{json.dumps(data)}')
@@ -111,25 +114,33 @@ class CloudMusic():
                     if k.strip() in ["Max-Age","Expires","Path"]:
                         continue
                     cookies[k.strip()] = v
-                timestamp = str(int(datetime.now().timestamp()))
-                #获取uid信息
-                status_url = f'{self.api_url}/login/status?timestamp={quote(timestamp)}'
-                data = await http_get(status_url)
-                _LOGGER.debug(f'url:{status_url},resp:{json.dumps(data)}')
-                res_data = data.get('data', {})
-                res_code = res_data['code']
-                if res_code == 200:
-                    # 写入cookie
-                    uid = res_data['account']['id']
-                    self.userinfo = {
-                        'uid': uid,
-                        'cookie': cookies
-                    }
-                    save_json(self.userinfo_filepath, self.userinfo)
-                    break
-                else:
-                    #获取状态失败,再来一次
-                    continue
+                get_status_times = 3
+                while(get_status_times>0):
+                    timestamp = str(datetime.now().timestamp())
+                    #获取uid信息
+                    status_url = f'{self.api_url}/login/status?key={quote(unikey)}&timestamp={quote(timestamp)}'
+                    data = await http_get(status_url, cookies)
+                    _LOGGER.debug(f'url:{status_url},resp:{json.dumps(data)}')
+                    res_data = data.get('data', {})
+                    res_code = res_data['code']
+                    if res_code == 200 and res_data['profile'] is not None:
+                        # 写入cookie
+                        uid = res_data['profile']['userId']
+                        self.userinfo = {
+                            'uid': uid,
+                            'cookie': cookies
+                        }
+                        save_json(self.userinfo_filepath, self.userinfo)
+                        persistent_notification.async_create(self.hass , '登陆成功, uid:' + str(uid), "ha_cloud_music")
+                        break
+                    else:
+                        #获取状态失败,再来一次
+                        get_status_times = get_status_times-1
+                        _LOGGER.debug(f'get status failed, try again, left retry times: {get_status_times}')
+                        persistent_notification.async_create(self.hass , f'获取状态失败,1s后重试,剩余重试次数: {get_status_times}', "ha_cloud_music")
+                        await asyncio.sleep(1)
+                        continue
+                break
             else:
                 break
 
